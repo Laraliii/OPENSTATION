@@ -598,10 +598,13 @@
     if ($("btnWizTestSay")) $("btnWizTestSay").textContent = `🎤 Разбудить (${clean})`;
     if ($("aliceTextPrompt")) $("aliceTextPrompt").placeholder = `Написать «${clean}» текстом (ответит голосом)...`;
     if ($("aliceEmptyHint")) $("aliceEmptyHint").textContent = `Скажите «${clean}...» или нажмите «Разбудить (${clean})».`;
-    if ($("wizWakeLabel")) $("wizWakeLabel").textContent = `Откликаться на слово «${clean}»`;
+    const isAlisa = clean.toLowerCase() === "алиса" || clean.toLowerCase() === "alisa";
+    if ($("wizWakeLabel")) $("wizWakeLabel").textContent = isAlisa
+      ? "Откликаться на «Алиса» (штатный Yandex-споттер)"
+      : `Откликаться на «${clean}» (OpenStation KWS)`;
     if ($("tmVoiceHint")) $("tmVoiceHint").textContent = `Или голосом: «${clean}, разбуди меня в 7:30 по будням».`;
     if ($("haVoiceHint")) $("haVoiceHint").textContent = `Устройства синхронизируются с Home Assistant. Можно сказать: «${clean}, выключи свет в гостиной».`;
-    if ($("astNameHint")) $("astNameHint").textContent = `Ассистент откликается на имя «${clean}» и автоматически подбирает стиль и голос.`;
+    if ($("astNameHint")) $("astNameHint").textContent = `Ассистент откликается на имя «${clean}» и автоматически подбирает стиль и голос. ${isAlisa ? "Используется штатный Yandex-споттер." : "Используется OpenStation KWS."}`;
     document.querySelectorAll("#astNamePresets .seg, #wizNamePresets .seg").forEach((b) => {
       b.classList.toggle("active", (b.dataset.aname || "").toLowerCase() === clean.toLowerCase());
     });

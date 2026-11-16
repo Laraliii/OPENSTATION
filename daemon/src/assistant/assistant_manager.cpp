@@ -9,9 +9,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <ctime>
+#include <fcntl.h>
 #include <memory>
+#include <unistd.h>
 
 namespace openstation {
 
@@ -27,11 +30,42 @@ constexpr const char* kCaBundlePath = "/data/local/openstation/cacert.pem";
 constexpr size_t kTxChunkSamples = 1600;
 constexpr size_t kMaxConnectingPcmSamples = 16000 * 6;
 constexpr size_t kMaxLivePcmSamples = 16000 * 2;
+// Separate, higher threshold for closing a Gemini Live audio stream. The VQE output
+// has a room-noise floor around 100-500 RMS, so the sensitive dialogue threshold
+// would never let a turn end.
+constexpr float kVoiceEndRmsThreshold = 650.0f;
 
 int64_t steady_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+// Optional tap for the stock Yandex spotter helper (glibc chroot).
+// The helper reads 16 kHz mono PCM from this FIFO. When it is not running,
+// open/write fail harmlessly and the audio path is unaffected.
+int g_stock_spotter_fd = -2;
+int64_t g_stock_spotter_next_try_ms = 0;
+constexpr const char* kStockSpotterFifo =
+    "/data/local/spotter-root/run/spotter.fifo";
+
+// The stock Yandex spotter is trained for "Алиса" only. Keep the existing
+// Sherpa KWS engine for every other assistant name, exactly as before.
+bool is_alisa_name(const std::string& name) {
+    return name == "\xD0\x90\xD0\xBB\xD0\xB8\xD1\x81\xD0\xB0" || // Алиса
+           name == "\xD0\xB0\xD0\xBB\xD0\xB8\xD1\x81\xD0\xB0" || // алиса
+           name == "Alisa" || name == "ALISA" || name == "alisa";
+}
+
+bool stock_wake_available() {
+    return ::access("/data/local/spotter-root/probe", X_OK) == 0 &&
+           ::access("/data/local/spotter-root/run_spotter.sh", X_OK) == 0 &&
+           ::access("/data/local/spotter-root/models/alisa-2023/acoustic_model.nnet",
+                    R_OK) == 0;
+}
+
+bool use_stock_wake(const AssistantConfig& c) {
+    return c.wake_word_enabled && is_alisa_name(c.name) && stock_wake_available();
 }
 
 std::string now_hhmmss() {
@@ -191,7 +225,8 @@ const char* AssistantManager::state_str(AssistantState st) {
 
 WakeWordSettings AssistantManager::to_ww_settings(const AssistantConfig& c, int mic_sensitivity) {
     WakeWordSettings ww;
-    ww.enabled = c.enabled && (c.mode == "gemini") && c.wake_word_enabled;
+    ww.enabled = c.enabled && (c.mode == "gemini") && c.wake_word_enabled &&
+                 !use_stock_wake(c);
     ww.keywords = c.kws_keywords;
     ww.threshold = c.kws_threshold;
     ww.score = c.kws_score;
@@ -252,6 +287,7 @@ void AssistantManager::stop() {
 
 void AssistantManager::update_config(const AssistantConfig& cfg) {
     bool stop_cur = false;
+    bool reload_wake = false;
     int sens = 85;
     {
         std::lock_guard<std::mutex> lk(cfg_mu_);
@@ -264,10 +300,21 @@ void AssistantManager::update_config(const AssistantConfig& cfg) {
         if (!cfg.enabled || cfg.mode != "gemini") {
             stop_cur = true;
         }
+        // Switching between the stock "Алиса" spotter and the Sherpa KWS
+        // engine must recreate the KWS worker, not just update its flags:
+        // a disabled KWS worker does not re-arm on a dirty settings update.
+        const bool prev_stock = use_stock_wake(cfg_);
+        const bool next_stock = use_stock_wake(cfg);
+        reload_wake = (cfg.name != cfg_.name) || (prev_stock != next_stock);
         cfg_ = cfg;
         sens = mic_sensitivity_;
     }
-    wake_word_.update_settings(to_ww_settings(cfg, sens));
+    const WakeWordSettings ww = to_ww_settings(cfg, sens);
+    if (reload_wake) {
+        wake_word_.restart(ww);
+    } else {
+        wake_word_.update_settings(ww);
+    }
     if (stop_cur) {
         stop_session("mode_changed");
     }
@@ -317,6 +364,16 @@ void AssistantManager::feed_audio_16k(const int16_t* samples, size_t count, floa
     if (rms >= dialogue_activity_threshold(noise_rms)) {
         last_speech_ms_.store(steady_now_ms());
     }
+    // Do not count the station's own TTS / playback tail as user voice.
+    if (rms >= kVoiceEndRmsThreshold &&
+        !(cb_.is_playback_or_tail_active && cb_.is_playback_or_tail_active())) {
+        last_voice_ms_.store(steady_now_ms());
+    }
+
+    if (!use_stock_wake(c) && g_stock_spotter_fd >= 0) {
+        ::close(g_stock_spotter_fd);
+        g_stock_spotter_fd = -2;
+    }
 
     AssistantState st = state_.load();
     if (st == AssistantState::Idle || st == AssistantState::Error) {
@@ -324,7 +381,7 @@ void AssistantManager::feed_audio_16k(const int16_t* samples, size_t count, floa
         if (steady_now_ms() < wake_suppress_until_ms_.load()) return;
         if (cb_.is_playback_or_tail_active && cb_.is_playback_or_tail_active()) return;
 
-        // Maintain rolling pre-roll PCM buffer
+        // Maintain rolling pre-roll PCM buffer (used by stock and KWS wake turns)
         size_t max_pre = static_cast<size_t>(std::max(0, c.pre_roll_ms)) * 16U;
         if (max_pre > 0) {
             std::lock_guard<std::mutex> lk(pre_mu_);
@@ -340,7 +397,26 @@ void AssistantManager::feed_audio_16k(const int16_t* samples, size_t count, floa
             }
         }
 
-        if (c.wake_word_enabled) {
+        if (use_stock_wake(c)) {
+            // Feed the stock Yandex spotter only while idle. During a session the
+            // daemon's own VAD handles barge-in, and the TTS voice must not be
+            // mistaken for a new wake word.
+            const int64_t now_ms = steady_now_ms();
+            if (g_stock_spotter_fd < 0 && now_ms >= g_stock_spotter_next_try_ms) {
+                g_stock_spotter_next_try_ms = now_ms + 1000;
+                g_stock_spotter_fd = ::open(kStockSpotterFifo,
+                                            O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+            }
+            if (g_stock_spotter_fd >= 0) {
+                const ssize_t n = ::write(g_stock_spotter_fd, samples,
+                                          count * sizeof(int16_t));
+                if (n < 0 && (errno == EPIPE || errno == ENXIO || errno == EBADF)) {
+                    ::close(g_stock_spotter_fd);
+                    g_stock_spotter_fd = -2;
+                    g_stock_spotter_next_try_ms = now_ms + 1000;
+                }
+            }
+        } else if (c.wake_word_enabled) {
             wake_word_.feed_audio_16k(samples, count);
         }
         return;
@@ -372,6 +448,21 @@ bool AssistantManager::is_active() const {
 bool AssistantManager::trigger_session(const std::string& reason) {
     if (is_active()) return true;
     return start_session_internal(TriggerSource::Manual, "", reason);
+}
+
+bool AssistantManager::trigger_wake_session(const std::string& keyword) {
+    if (!running_.load()) return false;
+    AssistantConfig c;
+    {
+        std::lock_guard<std::mutex> lk(cfg_mu_);
+        c = cfg_;
+    }
+    // Stale FIFO detections must not trigger when the user selected another
+    // assistant name (Sherpa KWS mode).
+    if (!use_stock_wake(c)) return false;
+    stock_wake_detections_.fetch_add(1, std::memory_order_relaxed);
+    return start_session_internal(TriggerSource::WakeWord, "",
+                                  keyword.empty() ? "stock" : keyword);
 }
 
 bool AssistantManager::toggle_session() {
@@ -1319,6 +1410,8 @@ void AssistantManager::session_worker(uint64_t sid,
     auto listen_unconfirmed_since = session_start_tp;
     auto last_pcm_flush_tp = session_start_tp;
     int64_t initial_speech_ms = last_speech_ms_.load();
+    bool audio_sent_since_end = false;
+    int64_t last_audio_end_ms = 0;
 
     auto send_client_text = [&](const std::string& t) -> bool {
         using json::Value;
@@ -1348,6 +1441,18 @@ void AssistantManager::session_worker(uint64_t sid,
         aud["mimeType"] = Value::make_str("audio/pcm;rate=16000");
         Value ri = Value::make_obj();
         ri["audio"] = std::move(aud);
+        Value msg = Value::make_obj();
+        msg["realtimeInput"] = std::move(ri);
+        return ws.send_text(msg.dump(-1));
+    };
+
+    // Gemini Live keeps an automatic-VAD turn open indefinitely unless the client
+    // explicitly ends the audio stream. Without this, the server never finalizes the
+    // user's utterance (no transcription / no answer).
+    auto send_audio_stream_end = [&]() -> bool {
+        using json::Value;
+        Value ri = Value::make_obj();
+        ri["audioStreamEnd"] = Value::make_bool(true);
         Value msg = Value::make_obj();
         msg["realtimeInput"] = std::move(ri);
         return ws.send_text(msg.dump(-1));
@@ -1857,6 +1962,25 @@ void AssistantManager::session_worker(uint64_t sid,
                         off += n;
                     }
                     if (fatal_error) break;
+                    audio_sent_since_end = true;
+                }
+            }
+
+            // 3b. Close the Gemini Live audio stream after the user has been silent.
+            // The server's automatic VAD alone does not finalize turns on this endpoint.
+            if (audio_sent_since_end && state_.load() == AssistantState::Listening) {
+                const int64_t voice_ms = last_voice_ms_.load();
+                const int64_t now_ms = steady_now_ms();
+                const int silence_ms = std::clamp(cfg_snap.vad_silence_ms, 600, 2000);
+                if (voice_ms > last_audio_end_ms && now_ms - voice_ms >= silence_ms) {
+                    if (send_audio_stream_end()) {
+                        last_audio_end_ms = now_ms;
+                        audio_sent_since_end = false;
+                    } else {
+                        set_error("Ошибка закрытия аудиопотока Gemini Live", src != TriggerSource::Text);
+                        fatal_error = true;
+                        break;
+                    }
                 }
             }
 
@@ -1969,13 +2093,26 @@ json::Value AssistantManager::get_status_json() {
     obj["active"] = Value::make_bool(is_active());
     obj["micMuted"] = Value::make_bool(mic_muted_.load());
     obj["sessionsCount"] = Value::make_int(static_cast<int64_t>(sessions_count_.load()));
-    obj["wakeWord"] = wake_word_.get_status_json();
 
     AssistantConfig c;
     {
         std::lock_guard<std::mutex> lk(cfg_mu_);
         c = cfg_;
     }
+
+    Value ww = wake_word_.get_status_json();
+    const bool stock_wake = use_stock_wake(c);
+    ww["engine"] = Value::make_str(stock_wake ? "stock" : "kws");
+    if (stock_wake) {
+        const bool stock_ready = g_stock_spotter_fd >= 0;
+        ww["ready"] = Value::make_bool(stock_ready);
+        ww["paused"] = Value::make_bool(mic_muted_.load());
+        ww["status"] = Value::make_str(stock_ready ? "stock_listening" : "stock_waiting");
+        ww["detections"] = Value::make_int(
+            static_cast<int64_t>(stock_wake_detections_.load(std::memory_order_relaxed)));
+    }
+    obj["wakeWord"] = ww;
+
     obj["enabled"] = Value::make_bool(c.enabled);
     obj["mode"] = Value::make_str(c.mode);
     obj["model"] = Value::make_str("gemini-3.8-live");
