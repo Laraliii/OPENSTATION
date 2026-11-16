@@ -801,7 +801,7 @@ class SetupWizardActivity : Activity() {
         tvAliceHeading = makeScreenTitle("Шаг 4 · Ассистент «Алиса»")
         rightCol.addView(tvAliceHeading)
 
-        rightCol.addView(makeSubLabel("Имя и слово активации · «Алиса» — штатный Yandex-споттер, остальные — OpenStation KWS"))
+        rightCol.addView(makeSubLabel("Имя и слово активации · «Алиса»/«Яндекс» — штатный Yandex-споттер, остальные — OpenStation KWS"))
         val nameRow = makeChoiceRow()
         listOf("Алиса", "Джарвис", "Пятница", "Макс").forEach { n ->
             val p = makeChoicePill(n) { applyAssistantNameChoice(n) }

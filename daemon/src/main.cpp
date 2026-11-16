@@ -2059,11 +2059,14 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Start the optional stock Yandex spotter bridge (glibc chroot helper).
-    // It is a no-op when /data/local/spotter-root/run_spotter.sh is absent.
-    spawn_detached({"/system/bin/sh", "-c",
-        "if [ -x /data/local/spotter-root/run_spotter.sh ]; then "
-        "exec /system/bin/sh /data/local/spotter-root/run_spotter.sh; fi"});
+    // Start the optional stock Yandex spotter bridges (glibc chroot helpers).
+    // Both are no-ops when the corresponding script is absent.
+    for (const char* script : {"/data/local/spotter-root/run_spotter.sh",
+                               "/data/local/spotter-root/run_spotter_yandex.sh"}) {
+        std::string cmd = "if [ -x " + std::string(script) +
+                          " ]; then exec /system/bin/sh " + script + "; fi";
+        spawn_detached({"/system/bin/sh", "-c", cmd});
+    }
 
     std::thread geo_thread([&]() {
         bool need_geo = false;

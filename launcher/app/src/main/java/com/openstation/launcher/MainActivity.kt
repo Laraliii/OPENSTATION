@@ -4955,7 +4955,7 @@ class MainActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
         })
         panel.addView(TextView(this).apply {
-            text = "Выберите имя для офлайн-распознавания (Wake Word), тембр голоса и стиль ответов. «Алиса» — штатный Yandex-споттер, остальные имена — OpenStation KWS."
+            text = "Выберите имя для офлайн-распознавания (Wake Word), тембр голоса и стиль ответов. «Алиса» и «Яндекс» — штатный Yandex-споттер, остальные имена — OpenStation KWS."
             setTextColor(Color.parseColor("#94A3B8"))
             textSize = 11.5f
             setPadding(0, dp(2), 0, dp(8))

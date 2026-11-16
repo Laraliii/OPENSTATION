@@ -600,11 +600,11 @@
     if ($("aliceEmptyHint")) $("aliceEmptyHint").textContent = `Скажите «${clean}...» или нажмите «Разбудить (${clean})».`;
     const isAlisa = clean.toLowerCase() === "алиса" || clean.toLowerCase() === "alisa";
     if ($("wizWakeLabel")) $("wizWakeLabel").textContent = isAlisa
-      ? "Откликаться на «Алиса» (штатный Yandex-споттер)"
+      ? "Откликаться на «Алиса»/«Яндекс» (штатный Yandex-споттер)"
       : `Откликаться на «${clean}» (OpenStation KWS)`;
     if ($("tmVoiceHint")) $("tmVoiceHint").textContent = `Или голосом: «${clean}, разбуди меня в 7:30 по будням».`;
     if ($("haVoiceHint")) $("haVoiceHint").textContent = `Устройства синхронизируются с Home Assistant. Можно сказать: «${clean}, выключи свет в гостиной».`;
-    if ($("astNameHint")) $("astNameHint").textContent = `Ассистент откликается на имя «${clean}» и автоматически подбирает стиль и голос. ${isAlisa ? "Используется штатный Yandex-споттер." : "Используется OpenStation KWS."}`;
+    if ($("astNameHint")) $("astNameHint").textContent = `Ассистент откликается на имя «${clean}» и автоматически подбирает стиль и голос. ${isAlisa ? "Используется штатный Yandex-споттер («Алиса»/«Яндекс»)." : "Используется OpenStation KWS."}`;
     document.querySelectorAll("#astNamePresets .seg, #wizNamePresets .seg").forEach((b) => {
       b.classList.toggle("active", (b.dataset.aname || "").toLowerCase() === clean.toLowerCase());
     });
