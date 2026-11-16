@@ -53,6 +53,8 @@ StockSpotterTap g_stock_spotter_taps[] = {
     {"/data/local/spotter-root/run/spotter.fifo"},        // «Алиса»
     {"/data/local/spotter-root/run/spotter-yandex.fifo"}, // «Яндекс»
 };
+constexpr size_t kStockSpotterTapCount =
+    sizeof(g_stock_spotter_taps) / sizeof(g_stock_spotter_taps[0]);
 
 bool stock_spotter_model_available(const char* dir) {
     char path[256];
@@ -68,21 +70,32 @@ bool is_alisa_name(const std::string& name) {
            name == "Alisa" || name == "ALISA" || name == "alisa";
 }
 
-bool stock_yandex_available() {
-    return ::access("/data/local/spotter-root/run_spotter_yandex.sh", X_OK) == 0 &&
-           stock_spotter_model_available(
-               "/data/local/spotter-root/models/yandex-2022");
-}
-
-bool stock_wake_available() {
+bool stock_alisa_available() {
     return ::access("/data/local/spotter-root/probe", X_OK) == 0 &&
            ::access("/data/local/spotter-root/run_spotter.sh", X_OK) == 0 &&
            stock_spotter_model_available(
                "/data/local/spotter-root/models/alisa-2023");
 }
 
+bool stock_yandex_available() {
+    return ::access("/data/local/spotter-root/probe", X_OK) == 0 &&
+           ::access("/data/local/spotter-root/run_spotter_yandex.sh", X_OK) == 0 &&
+           stock_spotter_model_available(
+               "/data/local/spotter-root/models/yandex-2022");
+}
+
+size_t stock_phrase_index(const AssistantConfig& c) {
+    if (c.wake_phrase == "yandex" && stock_yandex_available()) return 1;
+    return 0;
+}
+
+bool stock_phrase_available(const AssistantConfig& c) {
+    return stock_phrase_index(c) == 1 ? stock_yandex_available()
+                                      : stock_alisa_available();
+}
+
 bool use_stock_wake(const AssistantConfig& c) {
-    return c.wake_word_enabled && is_alisa_name(c.name) && stock_wake_available();
+    return c.wake_word_enabled && is_alisa_name(c.name) && stock_phrase_available(c);
 }
 
 std::string now_hhmmss() {
@@ -419,11 +432,20 @@ void AssistantManager::feed_audio_16k(const int16_t* samples, size_t count, floa
         }
 
         if (use_stock_wake(c)) {
-            // Feed both stock spotter engines only while idle. During a session
-            // the daemon's own VAD handles barge-in, and the TTS voice must not
-            // be mistaken for a new wake word.
+            // Feed only the selected stock spotter engine while idle. The other
+            // phrase must stay completely silent so both wake words can never
+            // trigger at the same time.
+            const size_t active = stock_phrase_index(c);
             const int64_t now_ms = steady_now_ms();
-            for (auto& tap : g_stock_spotter_taps) {
+            for (size_t i = 0; i < kStockSpotterTapCount; ++i) {
+                auto& tap = g_stock_spotter_taps[i];
+                if (i != active) {
+                    if (tap.fd >= 0) {
+                        ::close(tap.fd);
+                        tap.fd = -2;
+                    }
+                    continue;
+                }
                 if (tap.fd < 0 && now_ms >= tap.next_try_ms) {
                     tap.next_try_ms = now_ms + 1000;
                     tap.fd = ::open(tap.fifo, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
@@ -481,6 +503,11 @@ bool AssistantManager::trigger_wake_session(const std::string& keyword) {
     // Stale FIFO detections must not trigger when the user selected another
     // assistant name (Sherpa KWS mode).
     if (!use_stock_wake(c)) return false;
+    const bool yandex_active = stock_phrase_index(c) == 1;
+    const bool yandex_hit = (keyword == "yandex");
+    const bool alisa_hit = (keyword == "stock" || keyword == "алиса" || keyword.empty());
+    // Only the currently selected phrase may start a session.
+    if ((yandex_hit && !yandex_active) || (alisa_hit && yandex_active)) return false;
     stock_wake_detections_.fetch_add(1, std::memory_order_relaxed);
     std::string phrase = keyword.empty() ? "stock" : keyword;
     if (phrase == "stock") phrase = "алиса";
@@ -2127,18 +2154,22 @@ json::Value AssistantManager::get_status_json() {
     const bool stock_wake = use_stock_wake(c);
     ww["engine"] = Value::make_str(stock_wake ? "stock" : "kws");
     if (stock_wake) {
-        const bool stock_ready = g_stock_spotter_taps[0].fd >= 0;
+        const size_t active = stock_phrase_index(c);
+        const bool stock_ready = g_stock_spotter_taps[active].fd >= 0;
         ww["ready"] = Value::make_bool(stock_ready);
         ww["paused"] = Value::make_bool(mic_muted_.load());
         ww["status"] = Value::make_str(stock_ready ? "stock_listening" : "stock_waiting");
         ww["detections"] = Value::make_int(
             static_cast<int64_t>(stock_wake_detections_.load(std::memory_order_relaxed)));
+        const char* active_phrase = active == 1 ? "яндекс" : "алиса";
+        ww["phrase"] = Value::make_str(active_phrase);
         Value phrases = Value::make_arr();
-        phrases.push(Value::make_str("алиса"));
-        if (stock_yandex_available()) {
-            phrases.push(Value::make_str("яндекс"));
-        }
+        phrases.push(Value::make_str(active_phrase));
         ww["phrases"] = std::move(phrases);
+        Value available = Value::make_arr();
+        if (stock_alisa_available()) available.push(Value::make_str("алиса"));
+        if (stock_yandex_available()) available.push(Value::make_str("яндекс"));
+        ww["availablePhrases"] = std::move(available);
     }
     obj["wakeWord"] = ww;
 
